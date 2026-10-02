@@ -307,12 +307,25 @@ session, `prompt=none` redirects to the registered callback with `error=login_re
 and the original `state`. `prompt=login` always displays the sign-in form. Other prompt
 values and combinations are not currently supported.
 
+Interactive POSTs must originate from a freshly fetched sign-in form. The form
+contains a one-use CSRF token bound to its authorization parameters and an HttpOnly
+pre-login cookie; both expire after ten minutes. Direct credential POSTs without
+that form transaction are rejected. An expired form must be reloaded. Automated
+clients must retain the form cookie and submit its hidden `csrf_token` field.
+
 Sessions are shared by app clients in the same user pool, not across pools. Silent
 reuse does not extend expiry. A successful interactive login replaces the current
 browser's session for that pool. `GET /logout?client_id=...&logout_uri=...` clears that
 session and redirects only to a URL registered in the client's `LogoutURLs`. This
 endpoint implements the sign-out-URL form of logout, not federated IdP logout or the
 `redirect_uri` form that starts a new login.
+
+Disabling a user revokes all of that user's browser sessions before reporting
+success. Re-enabling the user does not restore those sessions, including after a
+server restart. Logout rejects unregistered destinations and revokes every valid
+ID presented in duplicate session cookies; a storage failure never reports logout
+success. Request logging preserves the supplied logger's redaction configuration
+while excluding Cookie and Set-Cookie headers.
 
 The CLI stores sessions in `.cognito/browser-sessions.json` (mode `0600` on POSIX), so
 they survive server restarts. The file contains session ID hashes, user-pool/user

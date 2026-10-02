@@ -3,13 +3,18 @@ import Pino from "pino";
 import supertest from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ClockFake } from "../__tests__/clockFake";
+import { getLoginForm, submitLogin } from "../__tests__/loginForm";
 import { newMockCognitoService } from "../__tests__/mockCognitoService";
 import { newMockTokenGenerator } from "../__tests__/mockTokenGenerator";
 import { newMockUserPoolService } from "../__tests__/mockUserPoolService";
 import * as TDB from "../__tests__/testDataBuilder";
+import { Router } from "../server/Router";
 import { createServer, type ServerOptions } from "../server/server";
 import type { Services } from "../services";
-import { browserSessionCookieName } from "./browserSessionStore";
+import {
+  BrowserSessionStore,
+  browserSessionCookieName,
+} from "./browserSessionStore";
 
 const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const query = {
@@ -59,18 +64,22 @@ function fixture(options: ServerOptions = {}) {
       },
     },
   );
-  const app = createServer(vi.fn(), logger, options, {
+  const store = new BrowserSessionStore(clock);
+  const services = {
     clock,
     cognito,
     tokenGenerator,
-  } as unknown as Services).application;
+  } as unknown as Services;
+  const app = createServer(
+    Router(services),
+    logger,
+    options,
+    services,
+    store,
+  ).application;
   const request = supertest(app);
-  const login = (cookie?: string) =>
-    request
-      .post("/oauth2/authorize")
-      .set("Cookie", cookie ?? "")
-      .type("form")
-      .send(form);
+  const login = (cookie?: string, extra = {}, headers = {}) =>
+    submitLogin(request, { ...form, ...extra }, cookie, headers);
   const authorize = (cookie = "", extra = {}) =>
     request
       .get("/oauth2/authorize")
@@ -86,6 +95,8 @@ function fixture(options: ServerOptions = {}) {
     login,
     authorize,
     logs,
+    store,
+    app,
   };
 }
 
@@ -183,11 +194,13 @@ describe("OAuth browser sessions", () => {
     expect((await f.authorize(cookie, { prompt: "login" })).text).toContain(
       "<form",
     );
-    const bad = await f.request
-      .post("/oauth2/authorize")
-      .type("form")
-      .send({ ...form, password: "wrong" });
-    expect(bad.header["set-cookie"]).toBeUndefined();
+    const bad = await f.login(cookie, { password: "wrong" });
+    expect(bad.text).toContain("Incorrect username or password");
+    expect(
+      bad.header["set-cookie"].every((value: string) =>
+        value.startsWith(`${browserSessionCookieName("pool")}-login=`),
+      ),
+    ).toBe(true);
     const renewed = await f.login(cookie);
     expect(cookieOf(renewed)).not.toBe(cookie);
     expect(
@@ -301,15 +314,179 @@ describe("OAuth browser sessions", () => {
     expect((await f.request.get("/logout").query(logout)).status).toBe(400);
   });
 
+  it("binds one-time login tokens to this browser and the exact authorization request", async () => {
+    const original = cookieOf(await f.login());
+    const first = await getLoginForm(f.request, form);
+    const second = await getLoginForm(f.request, form);
+    const post = (
+      cookie: string,
+      fields: Record<string, string>,
+      headers = {},
+    ) =>
+      f.request
+        .post("/oauth2/authorize")
+        .set(headers)
+        .set("Cookie", `${original}; ${cookie}`)
+        .type("form")
+        .send(fields);
+    for (const [cookie, fields, headers] of [
+      [first.cookie, form, {}],
+      [first.cookie, { ...form, csrf_token: "tampered" }, {}],
+      [second.cookie, { ...form, csrf_token: first.csrf_token }, {}],
+      [
+        first.cookie,
+        { ...form, csrf_token: first.csrf_token, state: "changed" },
+        {},
+      ],
+      [
+        first.cookie,
+        { ...form, csrf_token: first.csrf_token },
+        { Origin: "https://attacker.invalid" },
+      ],
+      [
+        first.cookie,
+        { ...form, csrf_token: first.csrf_token },
+        { "Sec-Fetch-Site": "cross-site" },
+      ],
+    ] as [string, Record<string, string>, Record<string, string>][]) {
+      const result = await post(cookie, fields, headers);
+      expect(result.status).toBe(403);
+      expect(result.header["set-cookie"]).toBeUndefined();
+      expect((await f.authorize(original)).header.location).toContain("code=");
+    }
+    expect(
+      (await post(first.cookie, { ...form, csrf_token: first.csrf_token }))
+        .status,
+    ).toBe(302);
+    expect(
+      (await post(first.cookie, { ...form, csrf_token: first.csrf_token }))
+        .status,
+    ).toBe(403);
+    f.clock.advanceBy(600_000);
+    expect(
+      (await post(second.cookie, { ...form, csrf_token: second.csrf_token }))
+        .status,
+    ).toBe(403);
+  });
+
+  it("escapes authorization values in forms", async () => {
+    const state = '\"><script>alert("test")</script>&';
+    const result = await f.request
+      .get("/oauth2/authorize")
+      .query({ ...query, state, prompt: "login" });
+    expect(result.text).not.toContain("<script>");
+    expect(result.text).toContain("&quot;&gt;&lt;script&gt;");
+    expect(result.text).not.toContain(form.password);
+  });
+
+  it("revokes all duplicate cookie IDs without revoking another browser or pool", async () => {
+    const first = cookieOf(await f.login());
+    const second = cookieOf(await f.login());
+    const untouched = cookieOf(await f.login());
+    const other = await f.store.create("other", "user", "sub");
+    const header = `${first}; ${second}; ${first}; ${browserSessionCookieName("pool")}=invalid; ${browserSessionCookieName("pool")}=${other.id}`;
+    const result = await f.request
+      .get("/logout")
+      .query(logout)
+      .set("Cookie", header);
+    expect(result.status).toBe(302);
+    for (const cookie of [first, second])
+      expect((await f.authorize(cookie)).header.location).toContain(
+        "login_required",
+      );
+    expect((await f.authorize(untouched)).header.location).toContain("code=");
+    expect(await f.store.get(other.id, "other")).not.toBeNull();
+  });
+
+  it("never reports successful logout when revocation fails", async () => {
+    const cookie = cookieOf(await f.login());
+    vi.spyOn(f.store, "revokeMany").mockRejectedValueOnce(
+      new Error("synthetic storage failure"),
+    );
+    const result = await f.request
+      .get("/logout")
+      .query(logout)
+      .set("Cookie", cookie);
+    expect(result.status).toBe(500);
+    expect(result.header.location).toBeUndefined();
+    expect(result.header["set-cookie"]).toBeUndefined();
+    expect((await f.authorize(cookie)).header.location).toContain("code=");
+  });
+
+  it("invalidates every browser on disable and serializes concurrent authentication", async () => {
+    const first = cookieOf(await f.login());
+    const second = cookieOf(await f.login());
+    f.pool.saveUser.mockImplementation(async (_ctx, user) => {
+      f.pool.getUserByUsername.mockResolvedValue(user);
+    });
+    const admin = (action: string) =>
+      f.request
+        .post("/")
+        .set("X-Amz-Target", `AWSCognitoIdentityProviderService.${action}`)
+        .set("Content-Type", "application/x-amz-json-1.1")
+        .send(JSON.stringify({ UserPoolId: "pool", Username: "user" }));
+    const otherUser = await f.store.create("pool", "other-user", "other-sub");
+    expect((await admin("AdminDisableUser")).status).toBe(200);
+    expect((await admin("AdminEnableUser")).status).toBe(200);
+    for (const cookie of [first, second])
+      expect((await f.authorize(cookie)).header.location).toContain(
+        "login_required",
+      );
+    expect(await f.store.get(otherUser.id, "pool")).not.toBeNull();
+    const fresh = cookieOf(await f.login());
+    expect((await f.authorize(fresh)).header.location).toContain("code=");
+    let release = () => {};
+    const waiting = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = () => {};
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const revoke = f.store.revokeUser.bind(f.store);
+    vi.spyOn(f.store, "revokeUser").mockImplementationOnce(async (...args) => {
+      entered();
+      await waiting;
+      await revoke(...args);
+    });
+    const disable = admin("AdminDisableUser").then((res) => res);
+    await started;
+    const lock = vi.spyOn(f.store, "withUser");
+    // Separate listeners prevent supertest's first completed request from
+    // closing the server while the second request is still in flight.
+    const authorize = supertest(f.app)
+      .get("/oauth2/authorize")
+      .set("Cookie", fresh)
+      .query({ ...query, prompt: "none" })
+      .then((res) => res);
+    await vi.waitFor(() => expect(lock).toHaveBeenCalledOnce());
+    release();
+    expect((await disable).status).toBe(200);
+    expect((await authorize).header.location).toContain("login_required");
+  });
+
+  it("does not disable or report success when durable revocation fails", async () => {
+    vi.spyOn(f.store, "revokeUser").mockRejectedValueOnce(
+      new Error("synthetic storage failure"),
+    );
+    const result = await f.request
+      .post("/")
+      .set("X-Amz-Target", "AWSCognitoIdentityProviderService.AdminDisableUser")
+      .set("Content-Type", "application/x-amz-json-1.1")
+      .send(JSON.stringify({ UserPoolId: "pool", Username: "user" }));
+    expect(result.status).toBe(500);
+    expect(f.pool.saveUser).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])(
     "trusts forwarded HTTPS only when loopback proxy trust is explicitly enabled (%s)",
     async (trusted) => {
       const server = fixture(trusted ? { trustProxy: "loopback" } : {});
-      const login = await server.request
-        .post("/oauth2/authorize")
-        .set("X-Forwarded-Proto", "https")
-        .type("form")
-        .send(form);
+      const login = await server.login(
+        undefined,
+        {},
+        { "X-Forwarded-Proto": "https" },
+      );
       expect(login.header["set-cookie"][0].includes("; Secure")).toBe(trusted);
     },
   );

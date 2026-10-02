@@ -6,23 +6,40 @@ import {
   BrowserSessionStore,
   browserSessionCookieName,
   readBrowserSessionCookie,
+  readBrowserSessionCookies,
 } from "./browserSessionStore";
+import { type LoginRequest, LoginRequestStore } from "./loginRequestStore";
 import { verifyS256 } from "./pkce";
 
-const LOGIN_FORM = (params: {
+const escapeHtml = (value: string) =>
+  value.replace(
+    /[&<>"']/g,
+    (character) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
+        character
+      ] ?? character,
+  );
+
+const LOGIN_FORM = (input: {
   clientId: string;
   redirectUri: string;
   codeChallenge: string;
   codeChallengeMethod: string;
   scope: string;
   state: string;
+  csrfToken: string;
   error?: string;
-}) => `<!DOCTYPE html>
+}) => {
+  const params = Object.fromEntries(
+    Object.entries(input).map(([key, value]) => [key, escapeHtml(value ?? "")]),
+  ) as typeof input;
+  return `<!DOCTYPE html>
 <html>
 <head><title>Sign in</title></head>
 <body>
 ${params.error ? `<p style="color:red">${params.error}</p>` : ""}
 <form method="POST" action="/oauth2/authorize">
+  <input type="hidden" name="csrf_token" value="${params.csrfToken}" />
   <input type="hidden" name="client_id" value="${params.clientId}" />
   <input type="hidden" name="redirect_uri" value="${params.redirectUri}" />
   <input type="hidden" name="response_type" value="code" />
@@ -36,6 +53,7 @@ ${params.error ? `<p style="color:red">${params.error}</p>` : ""}
 </form>
 </body>
 </html>`;
+};
 
 function badRequest(res: Response, message: string) {
   res
@@ -49,6 +67,31 @@ export function attachOAuth2Routes(
   codeStore: AuthorizationCodeStore,
   sessions = new BrowserSessionStore(services.clock),
 ): void {
+  const loginRequests = new LoginRequestStore(services.clock);
+  const loginCookieName = (pool: string) =>
+    `${browserSessionCookieName(pool)}-login`;
+  const cookieOptions = (req: Request) => ({
+    httpOnly: true,
+    sameSite: "lax" as const,
+    secure: req.secure,
+    path: "/",
+  });
+  const showLogin = (
+    req: Request,
+    res: Response,
+    request: LoginRequest,
+    error?: string,
+  ) => {
+    const transaction = loginRequests.issue(request);
+    res.cookie(loginCookieName(request.userPoolId), transaction.browser, {
+      ...cookieOptions(req),
+      expires: new Date(transaction.expiresAt),
+    });
+    return res
+      .status(200)
+      .type("text/html")
+      .send(LOGIN_FORM({ ...request, csrfToken: transaction.token, error }));
+  };
   app.use(["/oauth2/authorize", "/logout"], (_req, res, next) => {
     res.set("Cache-Control", "no-store");
     next();
@@ -64,6 +107,20 @@ export function attachOAuth2Routes(
       state,
       prompt,
     } = req.query as Record<string, string>;
+
+    if (
+      [
+        client_id,
+        redirect_uri,
+        response_type,
+        code_challenge,
+        code_challenge_method,
+        scope,
+        state,
+        prompt,
+      ].some((value) => value !== undefined && typeof value !== "string")
+    )
+      return badRequest(res, "Invalid query parameters");
 
     if (!client_id) return badRequest(res, "Missing client_id");
     if (!redirect_uri) return badRequest(res, "Missing redirect_uri");
@@ -96,28 +153,44 @@ export function attachOAuth2Routes(
       client_id,
     );
     if (prompt !== "login") {
-      const session = await sessions.get(
-        readBrowserSessionCookie(req.headers.cookie, userPool.options.Id),
+      const sessionId = readBrowserSessionCookie(
+        req.headers.cookie,
         userPool.options.Id,
       );
-      const user = session
-        ? await userPool.getUserByUsername(ctx, session.username)
-        : null;
-      if (
-        user?.Enabled &&
-        user.UserStatus !== "UNCONFIRMED" &&
-        user.Attributes.find((attribute) => attribute.Name === "sub")?.Value ===
-          session?.subject
-      ) {
-        const code = codeStore.create({
-          clientId: client_id,
-          userPoolId: userPool.options.Id,
-          username: user.Username,
-          redirectUri: redirect_uri,
-          codeChallenge: code_challenge,
-          scope: scope ?? "",
-          state,
-        });
+      const session = await sessions.get(sessionId, userPool.options.Id);
+      const code = session
+        ? await sessions.withUser(
+            userPool.options.Id,
+            session.username,
+            async () => {
+              const current = await sessions.get(
+                sessionId,
+                userPool.options.Id,
+              );
+              const user = current
+                ? await userPool.getUserByUsername(ctx, current.username)
+                : null;
+              if (
+                user?.Enabled &&
+                user.UserStatus !== "UNCONFIRMED" &&
+                user.Attributes.find((attribute) => attribute.Name === "sub")
+                  ?.Value === current?.subject
+              ) {
+                return codeStore.create({
+                  clientId: client_id,
+                  userPoolId: userPool.options.Id,
+                  username: user.Username,
+                  redirectUri: redirect_uri,
+                  codeChallenge: code_challenge,
+                  scope: scope ?? "",
+                  state,
+                });
+              }
+              return undefined;
+            },
+          )
+        : undefined;
+      if (code) {
         const redirectUrl = new URL(redirect_uri);
         redirectUrl.searchParams.set("code", code);
         if (state) redirectUrl.searchParams.set("state", state);
@@ -132,19 +205,15 @@ export function attachOAuth2Routes(
       return res.redirect(redirectUrl.toString());
     }
 
-    res
-      .status(200)
-      .type("text/html")
-      .send(
-        LOGIN_FORM({
-          clientId: client_id,
-          redirectUri: redirect_uri,
-          codeChallenge: code_challenge,
-          codeChallengeMethod: code_challenge_method ?? "S256",
-          scope: scope ?? "",
-          state: state ?? "",
-        }),
-      );
+    return showLogin(req, res, {
+      clientId: client_id,
+      userPoolId: userPool.options.Id,
+      redirectUri: redirect_uri,
+      codeChallenge: code_challenge,
+      codeChallengeMethod: code_challenge_method ?? "S256",
+      scope: scope ?? "",
+      state: state ?? "",
+    });
   });
 
   app.post("/oauth2/authorize", async (req: Request, res: Response) => {
@@ -158,7 +227,24 @@ export function attachOAuth2Routes(
       state,
       username,
       password,
+      csrf_token,
     } = req.body as Record<string, string>;
+
+    if (
+      [
+        client_id,
+        redirect_uri,
+        response_type,
+        code_challenge,
+        code_challenge_method,
+        scope,
+        state,
+        username,
+        password,
+        csrf_token,
+      ].some((value) => value !== undefined && typeof value !== "string")
+    )
+      return badRequest(res, "Invalid form fields");
 
     if (
       !client_id ||
@@ -193,64 +279,105 @@ export function attachOAuth2Routes(
       return badRequest(res, "Invalid client_id");
     }
 
-    const user = await userPool.getUserByUsername(ctx, username);
-
-    if (
-      !user ||
-      !user.Enabled ||
-      user.Password !== password ||
-      user.UserStatus === "UNCONFIRMED"
-    ) {
-      res
-        .status(200)
-        .type("text/html")
-        .send(
-          LOGIN_FORM({
-            clientId: client_id,
-            redirectUri: redirect_uri,
-            codeChallenge: code_challenge,
-            codeChallengeMethod: code_challenge_method ?? "S256",
-            scope: scope ?? "",
-            state: state ?? "",
-            error: "Incorrect username or password.",
-          }),
-        );
-      return;
-    }
-
-    const subject = user.Attributes.find(
-      (attribute) => attribute.Name === "sub",
-    )?.Value;
-    if (!subject) return badRequest(res, "User is missing sub");
-    const session = await sessions.create(
-      userPool.options.Id,
-      user.Username,
-      subject,
-      readBrowserSessionCookie(req.headers.cookie, userPool.options.Id),
-    );
-    res.cookie(browserSessionCookieName(userPool.options.Id), session.id, {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: req.secure,
-      path: "/",
-      expires: new Date(session.expiresAt),
-    });
-
-    const code = codeStore.create({
+    const loginRequest: LoginRequest = {
       clientId: client_id,
       userPoolId: userPool.options.Id,
-      username: user.Username,
       redirectUri: redirect_uri,
       codeChallenge: code_challenge,
+      codeChallengeMethod: code_challenge_method,
       scope: scope ?? "",
-      state: state ?? undefined,
-    });
+      state: state ?? "",
+    };
+    const cookies =
+      req.headers.cookie
+        ?.split(";")
+        .map((part) => part.trim())
+        .filter((part) =>
+          part.startsWith(`${loginCookieName(userPool.options.Id)}=`),
+        ) ?? [];
+    const browser =
+      cookies.length === 1
+        ? cookies[0].slice(loginCookieName(userPool.options.Id).length + 1)
+        : undefined;
+    const origin = req.get("origin");
+    if (
+      req.get("sec-fetch-site") === "cross-site" ||
+      (origin && origin !== `${req.protocol}://${req.host}`) ||
+      !loginRequests.consume(csrf_token, browser, loginRequest)
+    ) {
+      return res.status(403).json({
+        error: "invalid_request",
+        error_description:
+          "Invalid or expired login form. Reload the sign-in page.",
+      });
+    }
+    const candidate = await userPool.getUserByUsername(ctx, username);
+    if (!candidate)
+      return showLogin(
+        req,
+        res,
+        loginRequest,
+        "Incorrect username or password.",
+      );
+    return sessions.withUser(
+      userPool.options.Id,
+      candidate.Username,
+      async () => {
+        const user = await userPool.getUserByUsername(ctx, candidate.Username);
 
-    const redirectUrl = new URL(redirect_uri);
-    redirectUrl.searchParams.set("code", code);
-    if (state) redirectUrl.searchParams.set("state", state);
+        if (
+          !user ||
+          !user.Enabled ||
+          user.Password !== password ||
+          user.UserStatus === "UNCONFIRMED"
+        ) {
+          return showLogin(
+            req,
+            res,
+            loginRequest,
+            "Incorrect username or password.",
+          );
+        }
 
-    res.redirect(redirectUrl.toString());
+        const subject = user.Attributes.find(
+          (attribute) => attribute.Name === "sub",
+        )?.Value;
+        if (!subject) return badRequest(res, "User is missing sub");
+        const session = await sessions.create(
+          userPool.options.Id,
+          user.Username,
+          subject,
+          readBrowserSessionCookie(req.headers.cookie, userPool.options.Id),
+        );
+        res.cookie(browserSessionCookieName(userPool.options.Id), session.id, {
+          httpOnly: true,
+          sameSite: "lax",
+          secure: req.secure,
+          path: "/",
+          expires: new Date(session.expiresAt),
+        });
+        res.clearCookie(
+          loginCookieName(userPool.options.Id),
+          cookieOptions(req),
+        );
+
+        const code = codeStore.create({
+          clientId: client_id,
+          userPoolId: userPool.options.Id,
+          username: user.Username,
+          redirectUri: redirect_uri,
+          codeChallenge: code_challenge,
+          scope: scope ?? "",
+          state: state ?? undefined,
+        });
+
+        const redirectUrl = new URL(redirect_uri);
+        redirectUrl.searchParams.set("code", code);
+        if (state) redirectUrl.searchParams.set("state", state);
+
+        return res.redirect(redirectUrl.toString());
+      },
+    );
   });
 
   app.get("/logout", async (req: Request, res: Response) => {
@@ -271,8 +398,8 @@ export function attachOAuth2Routes(
       ctx,
       client_id,
     );
-    await sessions.revoke(
-      readBrowserSessionCookie(req.headers.cookie, userPool.options.Id),
+    await sessions.revokeMany(
+      readBrowserSessionCookies(req.headers.cookie, userPool.options.Id),
       userPool.options.Id,
     );
     res.clearCookie(browserSessionCookieName(userPool.options.Id), {
@@ -281,6 +408,7 @@ export function attachOAuth2Routes(
       secure: req.secure,
       path: "/",
     });
+    res.clearCookie(loginCookieName(userPool.options.Id), cookieOptions(req));
     return res.redirect(logout_uri);
   });
 

@@ -18,10 +18,22 @@ async function submitLogin(
   url: string,
   body: Record<string, string>,
 ): Promise<Response> {
+  const { username: _username, password: _password, ...params } = body;
+  const form = await getForm(url, { ...params, prompt: "login" });
+  const csrf_token = (await form.text()).match(
+    /name="csrf_token" value="([A-Za-z0-9_-]+)"/,
+  )?.[1];
+  if (!csrf_token) throw new Error("Missing login form token");
   return fetch(`${url}/oauth2/authorize`, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams(body).toString(),
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Cookie: form.headers
+        .getSetCookie()
+        .map((value) => value.split(";")[0])
+        .join("; "),
+    },
+    body: new URLSearchParams({ ...body, csrf_token }).toString(),
     redirect: "manual",
   });
 }

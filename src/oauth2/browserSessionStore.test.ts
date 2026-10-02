@@ -1,4 +1,11 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -76,6 +83,31 @@ describe("persisted browser sessions", () => {
       expect(await restarted.get(id, "pool")).not.toBeNull();
     expect(await restarted.get(otherPool.id, "other")).not.toBeNull();
     expect(replacement.expiresAt).toBe(first.expiresAt + 1000);
+  });
+
+  it("persists user-wide revocation across restart without affecting other users or pools", async () => {
+    const store = await BrowserSessionStore.load(clock, file);
+    const [first, second, other, otherPool] = await Promise.all([
+      store.create("pool", "user", "sub"),
+      store.create("pool", "user", "sub"),
+      store.create("pool", "other", "sub-2"),
+      store.create("other-pool", "user", "sub"),
+    ]);
+    await store.revokeUser("pool", "user");
+    const restarted = await BrowserSessionStore.load(clock, file);
+    for (const session of [first, second])
+      expect(await restarted.get(session.id, "pool")).toBeNull();
+    expect(await restarted.get(other.id, "pool")).not.toBeNull();
+    expect(await restarted.get(otherPool.id, "other-pool")).not.toBeNull();
+  });
+
+  it("keeps sessions in memory if durable revocation fails", async () => {
+    const store = await BrowserSessionStore.load(clock, file);
+    const session = await store.create("pool", "user", "sub");
+    await rm(file);
+    await mkdir(file);
+    await expect(store.revokeMany([session.id], "pool")).rejects.toThrow();
+    expect(await store.get(session.id, "pool")).not.toBeNull();
   });
 
   it("rejects corrupted stores instead of authenticating from partial data", async () => {

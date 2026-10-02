@@ -24,6 +24,7 @@ interface BrowserSession {
 export class BrowserSessionStore {
   private sessions = new Map<string, BrowserSession>();
   private writes: Promise<void> = Promise.resolve();
+  private readonly users = new Map<string, Promise<void>>();
 
   constructor(
     private readonly clock: Clock = new DateClock(),
@@ -102,11 +103,45 @@ export class BrowserSessionStore {
   }
 
   async revoke(id: string | undefined, userPoolId: string): Promise<void> {
-    if (!id) return;
+    return this.revokeMany(id ? [id] : [], userPoolId);
+  }
+
+  async revokeMany(ids: readonly string[], userPoolId: string): Promise<void> {
+    if (!ids.length) return;
     await this.update((sessions) => {
-      if (sessions.get(digest(id))?.userPoolId === userPoolId)
-        sessions.delete(digest(id));
+      for (const id of ids) {
+        if (sessions.get(digest(id))?.userPoolId === userPoolId)
+          sessions.delete(digest(id));
+      }
     });
+  }
+
+  async revokeUser(userPoolId: string, username: string): Promise<void> {
+    await this.update((sessions) => {
+      for (const [id, session] of sessions) {
+        if (session.userPoolId === userPoolId && session.username === username)
+          sessions.delete(id);
+      }
+    });
+  }
+
+  /** Serialize the user check with session issuance and administrative changes. */
+  withUser<T>(
+    userPoolId: string,
+    username: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const key = JSON.stringify([userPoolId, username]);
+    const result = (this.users.get(key) ?? Promise.resolve()).then(operation);
+    const settled = result.then(
+      () => {},
+      () => {},
+    );
+    this.users.set(key, settled);
+    void settled.then(() => {
+      if (this.users.get(key) === settled) this.users.delete(key);
+    });
+    return result;
   }
 
   private update(
@@ -155,4 +190,21 @@ export function readBrowserSessionCookie(
       .filter((part) => part.startsWith(name)) ?? [];
   // Duplicate cookies are ambiguous; never choose a caller-controlled ordering.
   return matches.length === 1 ? matches[0].slice(name.length) : undefined;
+}
+
+/** Logout revokes every presented ID, even when authentication is ambiguous. */
+export function readBrowserSessionCookies(
+  header: string | undefined,
+  userPoolId: string,
+): string[] {
+  const name = `${browserSessionCookieName(userPoolId)}=`;
+  return [
+    ...new Set(
+      (header?.split(";") ?? [])
+        .map((part) => part.trim())
+        .filter((part) => part.startsWith(name))
+        .map((part) => part.slice(name.length))
+        .filter((id) => /^[A-Za-z0-9_-]{43}$/.test(id)),
+    ),
+  ];
 }
