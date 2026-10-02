@@ -10,6 +10,7 @@ import * as uuid from "uuid";
 import { CognitoError, UnsupportedError } from "../errors";
 import PublicKey from "../keys/cognitoLocal.public.json";
 import { AuthorizationCodeStore } from "../oauth2/authorizationCodeStore";
+import type { BrowserSessionStore } from "../oauth2/browserSessionStore";
 import { attachOAuth2Routes } from "../oauth2/routes";
 import type { Services } from "../services";
 import type { Router } from "./Router";
@@ -18,6 +19,8 @@ export type ServerOptions = {
   port?: number;
   hostname?: string;
   development?: boolean;
+  /** Opt in only behind a trusted local TLS-terminating proxy. */
+  trustProxy?: "loopback";
 } & (
   | { https: true; key?: string; ca?: string; cert?: string }
   | { https?: false }
@@ -34,9 +37,11 @@ export const createServer = (
   logger: Logger,
   options: ServerOptions,
   services?: Services,
+  browserSessions?: BrowserSessionStore,
 ): Server => {
   const pino = Pino({
     logger,
+    redact: ["req.headers.cookie", 'res.headers["set-cookie"]'],
     useLevel: "debug",
     genReqId: () => uuid.v4().split("-")[0],
     quietReqLogger: true,
@@ -45,6 +50,7 @@ export const createServer = (
     },
   });
   const app = express();
+  if (options.trustProxy === "loopback") app.set("trust proxy", "loopback");
 
   app.use(pino);
 
@@ -80,7 +86,7 @@ export const createServer = (
 
   if (services) {
     const codeStore = new AuthorizationCodeStore();
-    attachOAuth2Routes(app, services, codeStore);
+    attachOAuth2Routes(app, services, codeStore, browserSessions);
   }
 
   app.post("/", (req, res) => {

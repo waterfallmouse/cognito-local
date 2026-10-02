@@ -2,6 +2,11 @@ import type { Application, Request, Response } from "express";
 import type { Services } from "../services";
 import type { Context } from "../services/context";
 import type { AuthorizationCodeStore } from "./authorizationCodeStore";
+import {
+  BrowserSessionStore,
+  browserSessionCookieName,
+  readBrowserSessionCookie,
+} from "./browserSessionStore";
 import { verifyS256 } from "./pkce";
 
 const LOGIN_FORM = (params: {
@@ -42,7 +47,12 @@ export function attachOAuth2Routes(
   app: Application,
   services: Services,
   codeStore: AuthorizationCodeStore,
+  sessions = new BrowserSessionStore(services.clock),
 ): void {
+  app.use(["/oauth2/authorize", "/logout"], (_req, res, next) => {
+    res.set("Cache-Control", "no-store");
+    next();
+  });
   app.get("/oauth2/authorize", async (req: Request, res: Response) => {
     const {
       client_id,
@@ -52,6 +62,7 @@ export function attachOAuth2Routes(
       code_challenge_method,
       scope,
       state,
+      prompt,
     } = req.query as Record<string, string>;
 
     if (!client_id) return badRequest(res, "Missing client_id");
@@ -61,6 +72,8 @@ export function attachOAuth2Routes(
     if (!code_challenge) return badRequest(res, "Missing code_challenge");
     if (code_challenge_method !== "S256")
       return badRequest(res, "code_challenge_method must be S256");
+    if (![undefined, "", "none", "login"].includes(prompt))
+      return badRequest(res, "Supported prompts are none and login");
 
     const ctx: Context = { logger: req.log };
 
@@ -76,6 +89,47 @@ export function attachOAuth2Routes(
     const allowedUrls = appClient.CallbackURLs ?? [];
     if (!allowedUrls.includes(redirect_uri)) {
       return badRequest(res, "redirect_uri not registered for this client");
+    }
+
+    const userPool = await services.cognito.getUserPoolForClientId(
+      ctx,
+      client_id,
+    );
+    if (prompt !== "login") {
+      const session = await sessions.get(
+        readBrowserSessionCookie(req.headers.cookie, userPool.options.Id),
+        userPool.options.Id,
+      );
+      const user = session
+        ? await userPool.getUserByUsername(ctx, session.username)
+        : null;
+      if (
+        user?.Enabled &&
+        user.UserStatus !== "UNCONFIRMED" &&
+        user.Attributes.find((attribute) => attribute.Name === "sub")?.Value ===
+          session?.subject
+      ) {
+        const code = codeStore.create({
+          clientId: client_id,
+          userPoolId: userPool.options.Id,
+          username: user.Username,
+          redirectUri: redirect_uri,
+          codeChallenge: code_challenge,
+          scope: scope ?? "",
+          state,
+        });
+        const redirectUrl = new URL(redirect_uri);
+        redirectUrl.searchParams.set("code", code);
+        if (state) redirectUrl.searchParams.set("state", state);
+        // Reuse never refreshes either the server expiry or the browser cookie.
+        return res.redirect(redirectUrl.toString());
+      }
+    }
+    if (prompt === "none") {
+      const redirectUrl = new URL(redirect_uri);
+      redirectUrl.searchParams.set("error", "login_required");
+      if (state) redirectUrl.searchParams.set("state", state);
+      return res.redirect(redirectUrl.toString());
     }
 
     res
@@ -143,6 +197,7 @@ export function attachOAuth2Routes(
 
     if (
       !user ||
+      !user.Enabled ||
       user.Password !== password ||
       user.UserStatus === "UNCONFIRMED"
     ) {
@@ -163,6 +218,24 @@ export function attachOAuth2Routes(
       return;
     }
 
+    const subject = user.Attributes.find(
+      (attribute) => attribute.Name === "sub",
+    )?.Value;
+    if (!subject) return badRequest(res, "User is missing sub");
+    const session = await sessions.create(
+      userPool.options.Id,
+      user.Username,
+      subject,
+      readBrowserSessionCookie(req.headers.cookie, userPool.options.Id),
+    );
+    res.cookie(browserSessionCookieName(userPool.options.Id), session.id, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: req.secure,
+      path: "/",
+      expires: new Date(session.expiresAt),
+    });
+
     const code = codeStore.create({
       clientId: client_id,
       userPoolId: userPool.options.Id,
@@ -178,6 +251,37 @@ export function attachOAuth2Routes(
     if (state) redirectUrl.searchParams.set("state", state);
 
     res.redirect(redirectUrl.toString());
+  });
+
+  app.get("/logout", async (req: Request, res: Response) => {
+    const { client_id, logout_uri } = req.query;
+    if (typeof client_id !== "string" || typeof logout_uri !== "string")
+      return badRequest(res, "Missing client_id or logout_uri");
+    const ctx: Context = { logger: req.log };
+    let appClient: Awaited<ReturnType<typeof services.cognito.getAppClient>>;
+    try {
+      appClient = await services.cognito.getAppClient(ctx, client_id);
+    } catch {
+      return badRequest(res, "Invalid client_id");
+    }
+    if (!appClient) return badRequest(res, "Invalid client_id");
+    if (!appClient.LogoutURLs?.includes(logout_uri))
+      return badRequest(res, "logout_uri not registered for this client");
+    const userPool = await services.cognito.getUserPoolForClientId(
+      ctx,
+      client_id,
+    );
+    await sessions.revoke(
+      readBrowserSessionCookie(req.headers.cookie, userPool.options.Id),
+      userPool.options.Id,
+    );
+    res.clearCookie(browserSessionCookieName(userPool.options.Id), {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: req.secure,
+      path: "/",
+    });
+    return res.redirect(logout_uri);
   });
 
   app.post("/oauth2/token", async (req: Request, res: Response) => {
@@ -196,47 +300,37 @@ export function attachOAuth2Routes(
 
       const stored = codeStore.consume(code);
       if (!stored) {
-        return res
-          .status(400)
-          .json({
-            error: "invalid_grant",
-            error_description: "Authorization code expired or invalid",
-          });
+        return res.status(400).json({
+          error: "invalid_grant",
+          error_description: "Authorization code expired or invalid",
+        });
       }
 
       if (stored.clientId !== client_id) {
-        return res
-          .status(400)
-          .json({
-            error: "invalid_grant",
-            error_description: "client_id mismatch",
-          });
+        return res.status(400).json({
+          error: "invalid_grant",
+          error_description: "client_id mismatch",
+        });
       }
       if (stored.redirectUri !== redirect_uri) {
-        return res
-          .status(400)
-          .json({
-            error: "invalid_grant",
-            error_description: "redirect_uri mismatch",
-          });
+        return res.status(400).json({
+          error: "invalid_grant",
+          error_description: "redirect_uri mismatch",
+        });
       }
       if (!verifyS256(code_verifier, stored.codeChallenge)) {
-        return res
-          .status(400)
-          .json({
-            error: "invalid_grant",
-            error_description: "code_verifier does not match code_challenge",
-          });
+        return res.status(400).json({
+          error: "invalid_grant",
+          error_description: "code_verifier does not match code_challenge",
+        });
       }
 
       const appClient = await services.cognito.getAppClient(ctx, client_id);
       if (!appClient) {
-        return res
-          .status(400)
-          .json({
-            error: "invalid_client",
-            error_description: "Unknown client",
-          });
+        return res.status(400).json({
+          error: "invalid_client",
+          error_description: "Unknown client",
+        });
       }
 
       const userPool = await services.cognito.getUserPool(
@@ -245,12 +339,10 @@ export function attachOAuth2Routes(
       );
       const user = await userPool.getUserByUsername(ctx, stored.username);
       if (!user) {
-        return res
-          .status(400)
-          .json({
-            error: "invalid_grant",
-            error_description: "User not found",
-          });
+        return res.status(400).json({
+          error: "invalid_grant",
+          error_description: "User not found",
+        });
       }
 
       const userGroups = await userPool.listUserGroupMembership(ctx, user);
@@ -282,12 +374,10 @@ export function attachOAuth2Routes(
 
       const appClient = await services.cognito.getAppClient(ctx, client_id);
       if (!appClient) {
-        return res
-          .status(400)
-          .json({
-            error: "invalid_client",
-            error_description: "Unknown client",
-          });
+        return res.status(400).json({
+          error: "invalid_client",
+          error_description: "Unknown client",
+        });
       }
 
       const userPool = await services.cognito.getUserPoolForClientId(
@@ -296,12 +386,10 @@ export function attachOAuth2Routes(
       );
       const user = await userPool.getUserByRefreshToken(ctx, refresh_token);
       if (!user) {
-        return res
-          .status(400)
-          .json({
-            error: "invalid_grant",
-            error_description: "Invalid refresh token",
-          });
+        return res.status(400).json({
+          error: "invalid_grant",
+          error_description: "Invalid refresh token",
+        });
       }
 
       const userGroups = await userPool.listUserGroupMembership(ctx, user);
@@ -322,11 +410,9 @@ export function attachOAuth2Routes(
       });
     }
 
-    return res
-      .status(400)
-      .json({
-        error: "unsupported_grant_type",
-        error_description: `Unsupported grant_type: ${grant_type}`,
-      });
+    return res.status(400).json({
+      error: "unsupported_grant_type",
+      error_description: `Unsupported grant_type: ${grant_type}`,
+    });
   });
 }
